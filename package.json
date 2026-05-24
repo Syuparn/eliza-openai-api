@@ -1,0 +1,16 @@
+{
+  "name": "eliza-openai-api",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible API server wrapping the Eliza (doctor) chatbot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": ["eliza", "doctor", "openai", "llm"],
+  "license": "ISC",
+  "dependencies": {
+    "elizabot": "^0.0.3",
+    "express": "^5.2.1",
+    "uuid": "^14.0.0"
+  }
+}
