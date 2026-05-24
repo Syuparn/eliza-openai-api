@@ -3,35 +3,77 @@
 const express = require('express');
 const elizabot = require('elizabot');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
 
 // -------------------------
-// State reconstruction
+// Session cache
 // -------------------------
-// OpenAI API sends the full message history on every request.
-// We replay all prior user messages through a fresh ElizaBot to
-// reconstruct internal state (memory buffer, topic tracking, etc.),
-// then process the latest user message to get the response.
-function buildResponse(messages) {
-  const userMessages = messages
-    .filter((m) => m.role === 'user')
-    .map((m) => (typeof m.content === 'string' ? m.content : m.content[0]?.text ?? ''));
+// Key:   SHA-256( JSON(messages_so_far + assistant_reply) )
+//   = the exact messages array the next request will send minus its last user message
+// Value: ElizaBot instance in the state AFTER processing those messages
+//
+// This avoids the "replay divergence" problem: if we rebuilt state by
+// replaying user messages through a fresh bot, the bot would generate
+// different (phantom) responses internally, which shifts its memory
+// buffer and response-rotation counters away from the real conversation.
+const sessions = new Map();
+const SESSION_MAX = 500;
 
-  if (userMessages.length === 0) {
+function hashMessages(messages) {
+  return crypto.createHash('sha256').update(JSON.stringify(messages)).digest('hex');
+}
+
+function evictOldestSession() {
+  const firstKey = sessions.keys().next().value;
+  sessions.delete(firstKey);
+}
+
+function buildResponse(messages) {
+  const lastMsg = messages[messages.length - 1];
+  const lastUserContent =
+    typeof lastMsg.content === 'string' ? lastMsg.content : lastMsg.content[0]?.text ?? '';
+
+  if (!lastUserContent) {
     throw new Error('No user message found');
   }
 
-  const bot = new elizabot();
+  // history = every message except the final user turn
+  const history = messages.slice(0, -1);
+  const historyKey = hashMessages(history);
 
-  // Replay all but the last message to rebuild bot state
-  for (let i = 0; i < userMessages.length - 1; i++) {
-    bot.transform(userMessages[i]);
+  let bot;
+  if (history.length === 0) {
+    // First turn: always a fresh bot
+    bot = new elizabot();
+  } else {
+    const cached = sessions.get(historyKey);
+    if (cached) {
+      bot = cached;
+    } else {
+      // Cache miss (e.g. server restart): fall back to replay.
+      // State fidelity is not guaranteed in this path.
+      bot = new elizabot();
+      history
+        .filter((m) => m.role === 'user')
+        .forEach((m) => {
+          const text = typeof m.content === 'string' ? m.content : m.content[0]?.text ?? '';
+          bot.transform(text);
+        });
+    }
   }
 
-  // Process the latest message and capture the response
-  const reply = bot.transform(userMessages[userMessages.length - 1]);
+  const reply = bot.transform(lastUserContent);
+
+  // Cache the bot under the key the NEXT request will look up:
+  //   hash( current messages + { role: assistant, content: reply } )
+  // That is exactly messages.slice(0, -1) of the next request.
+  const nextHistoryKey = hashMessages([...messages, { role: 'assistant', content: reply }]);
+  if (sessions.size >= SESSION_MAX) evictOldestSession();
+  sessions.set(nextHistoryKey, bot);
+
   return reply;
 }
 
